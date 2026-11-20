@@ -1,0 +1,34 @@
+name: Inert IIS module inventory
+on:
+  push:
+    branches: [h5-ancm-iis-inventory]
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Inspect runner and installed components
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Runner: $env:ImageOS $env:ImageVersion"
+          dotnet --list-sdks
+          Write-Host "IIS feature:"
+          Get-WindowsOptionalFeature -Online -FeatureName IIS-WebServerRole | Select-Object FeatureName,State | Format-List
+          $roots = @(
+            'C:\Program Files\IIS\Asp.Net Core Module\V2',
+            'C:\Program Files (x86)\IIS\Asp.Net Core Module\V2',
+            'C:\Windows\System32\inetsrv'
+          )
+          foreach ($root in $roots) {
+            Write-Host "Path $root exists: $(Test-Path $root)"
+            if (Test-Path $root) {
+              Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '^(aspnetcorev2|appcmd|w3wp)(\.dll|\.exe)$' } |
+                ForEach-Object {
+                  Write-Host "File $($_.FullName) version $($_.VersionInfo.FileVersion) SHA256 $((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+                }
+            }
+          }
