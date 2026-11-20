@@ -1,0 +1,101 @@
+name: Inert IIS reserved header echo
+on:
+  push:
+    branches: [h5-ancm-header-echo]
+permissions:
+  contents: read
+jobs:
+  echo:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Install official module and test local forwarding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Runner: $env:ImageOS $env:ImageVersion"
+          $url = 'https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/11.0.0/dotnet-hosting-11.0.0-win.exe'
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-hosting-11.0.0-win.exe'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Official hosting bundle signature invalid'
+          }
+          Write-Host "Bundle SHA256: $((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash)"
+          $install = Start-Process -FilePath $installer -ArgumentList '/quiet','/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+            throw "Bundle installation failed: $($install.ExitCode)"
+          }
+          $module = 'C:\Program Files\IIS\Asp.Net Core Module\V2\aspnetcorev2.dll'
+          if (-not (Test-Path $module)) { throw 'ANCM module missing' }
+          Write-Host "ANCM version: $((Get-Item $module).VersionInfo.FileVersion)"
+          Write-Host "ANCM SHA256: $((Get-FileHash -LiteralPath $module -Algorithm SHA256).Hash)"
+          $source = Join-Path $env:RUNNER_TEMP 'H5IisEchoSource'
+          $publish = Join-Path $env:RUNNER_TEMP 'H5IisEchoPublish'
+          dotnet new web --framework net11.0 --no-restore -o $source
+          if ($LASTEXITCODE -ne 0) { throw 'Template generation failed' }
+          @'
+          using System.Diagnostics;
+          using System.Text;
+          var builder = WebApplication.CreateBuilder(args);
+          var app = builder.Build();
+          app.MapGet("/echo", async context => {
+              var ctl = context.Request.Headers["X-H5-CONTROL"].ToString();
+              var reserved = context.Request.Headers.ContainsKey("MS-ASPNETCORE-H5") ? "1" : "0";
+              var body = $"process={Process.GetCurrentProcess().ProcessName};control={ctl};reserved={reserved}";
+              context.Response.ContentType = "text/plain";
+              context.Response.ContentLength = Encoding.UTF8.GetByteCount(body);
+              await context.Response.WriteAsync(body);
+          });
+          app.Run();
+          '@ | Set-Content -LiteralPath (Join-Path $source 'Program.cs') -Encoding UTF8
+          $project = (Get-ChildItem -LiteralPath $source -Filter '*.csproj' | Select-Object -First 1).FullName
+          dotnet publish $project -c Release -o $publish -p:AspNetCoreHostingModel=OutOfProcess
+          if ($LASTEXITCODE -ne 0) { throw 'Publish failed' }
+          $webConfig = Join-Path $publish 'web.config'
+          if (-not (Test-Path $webConfig)) { throw 'web.config missing' }
+          if (-not (Select-String -LiteralPath $webConfig -Pattern 'hostingModel="outofprocess"' -Quiet)) {
+            throw 'Out-of-process hosting model missing'
+          }
+          $appcmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
+          & $appcmd add site '/name:H5IisEcho' '/bindings:http/127.0.0.1:50521:' "/physicalPath:$publish"
+          if ($LASTEXITCODE -ne 0) { throw 'IIS site setup failed' }
+          $service = Get-Service W3SVC
+          if ($service.Status -ne 'Running') { Start-Service W3SVC }
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri 'http://127.0.0.1:50521/echo' -UseBasicParsing -TimeoutSec 5
+              if ($response.StatusCode -eq 200 -and $response.Content -match 'process=dotnet;control=;reserved=0') {
+                $ready = $true
+                break
+              }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) { throw 'Out-of-process IIS baseline failed to start' }
+          Write-Host 'Baseline out-of-process app ready'
+          function Invoke-RawEcho([string]$caseName, [string[]]$headerLines) {
+            $client = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 50521)
+            try {
+              $stream = $client.GetStream()
+              $stream.ReadTimeout = 10000
+              $request = "GET /echo HTTP/1.1`r`nHost: 127.0.0.1:50521`r`n" + ($headerLines -join "`r`n") + "`r`nConnection: close`r`n`r`n"
+              $bytes = [Text.Encoding]::ASCII.GetBytes($request)
+              $stream.Write($bytes, 0, $bytes.Length)
+              $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::ASCII)
+              $raw = $reader.ReadToEnd()
+              $parts = $raw -split "`r`n`r`n", 2
+              if ($parts.Count -ne 2) { throw "$caseName missing HTTP body" }
+              $status = ($parts[0] -split "`r`n")[0]
+              $body = $parts[1]
+              Write-Host "case=$caseName status=$status body=$body"
+              if ($status -notmatch '^HTTP/1\.1 200' -or $body -notmatch 'process=dotnet;control=' -or $body -notmatch ';reserved=0$') {
+                throw "$caseName forwarding result differed from expected denial"
+              }
+            }
+            finally { $client.Dispose() }
+          }
+          Invoke-RawEcho 'ordinary' @('X-H5-CONTROL: c1')
+          Invoke-RawEcho 'single-reserved' @('X-H5-CONTROL: c2', 'MS-ASPNETCORE-H5: marker1')
+          Invoke-RawEcho 'duplicate-reserved' @('X-H5-CONTROL: c3', 'MS-ASPNETCORE-H5: marker2', 'mS-aSpNeTcOrE-h5: marker3')
