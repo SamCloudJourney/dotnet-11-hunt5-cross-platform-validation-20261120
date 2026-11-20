@@ -1,4 +1,4 @@
-name: Inert IIS module inventory
+name: Inert IIS module setup inventory
 on:
   push:
     branches: [h5-ancm-iis-inventory]
@@ -7,7 +7,7 @@ permissions:
 jobs:
   inventory:
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Inspect runner and installed components
         shell: pwsh
@@ -15,6 +15,20 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Write-Host "Runner: $env:ImageOS $env:ImageVersion"
           dotnet --list-sdks
+          $url = 'https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/11.0.0/dotnet-hosting-11.0.0-win.exe'
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-hosting-11.0.0-win.exe'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          Write-Host "Hosting bundle signature: $($signature.Status) $($signature.SignerCertificate.Subject)"
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Hosting bundle signature did not validate as Microsoft'
+          }
+          Write-Host "Hosting bundle SHA256: $((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash)"
+          $install = Start-Process -FilePath $installer -ArgumentList '/quiet','/norestart' -Wait -PassThru
+          Write-Host "Hosting bundle installer exit code: $($install.ExitCode)"
+          if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+            throw "Hosting bundle installation failed: $($install.ExitCode)"
+          }
           Write-Host "IIS feature:"
           Get-WindowsOptionalFeature -Online -FeatureName IIS-WebServerRole | Select-Object FeatureName,State | Format-List
           $roots = @(
