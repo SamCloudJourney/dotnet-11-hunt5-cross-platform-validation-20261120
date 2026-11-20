@@ -1,7 +1,7 @@
-name: Inert Windows API buffer lifecycle
+name: Inert Windows WebSocket timing
 on:
   push:
-    branches: [h5-winhttp-api-probe]
+    branches: [h5-winhttp-backpressure]
   workflow_dispatch:
 
 permissions:
@@ -31,10 +31,10 @@ jobs:
             Start-Sleep -Seconds 2
             .\probe.exe
             if ($LASTEXITCODE -ne 0) { throw "probe failed: $LASTEXITCODE" }
-            if (-not $server.WaitForExit(15000)) { throw 'loopback server timed out' }
+            if (-not $server.WaitForExit(120000)) { throw 'loopback server timed out' }
             if ($server.ExitCode -ne 0) { throw "loopback server failed: $($server.ExitCode)" }
             $observed = @(Get-Content 'server.log' | Where-Object { $_ -match '"reason":' })
-            if ($observed.Count -ne 2) { throw "expected two close observations; got $($observed.Count)" }
+            if ($observed.Count -ne 3) { throw "expected three close observations; got $($observed.Count)" }
           }
           finally {
             if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
