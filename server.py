@@ -3,6 +3,7 @@ import hashlib
 import json
 import socket
 import struct
+import time
 
 
 def read_exact(conn, count):
@@ -17,7 +18,8 @@ def read_exact(conn, count):
 
 def one_connection(listener):
     conn, _ = listener.accept()
-    conn.settimeout(10)
+    conn.settimeout(40)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     with conn:
         request = bytearray()
         while b"\r\n\r\n" not in request:
@@ -39,16 +41,24 @@ def one_connection(listener):
                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                       f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode("ascii"))
 
-        first, second = read_exact(conn, 2)
-        length = second & 0x7F
-        if length == 126:
-            length = struct.unpack("!H", read_exact(conn, 2))[0]
-        if length > 125:
-            raise ValueError("unexpected frame length")
-        mask = read_exact(conn, 4) if second & 0x80 else b"\0" * 4
-        payload = read_exact(conn, length)
-        payload = bytes(value ^ mask[i % 4] for i, value in enumerate(payload))
-        if first & 0x0F != 8:
+        if path.startswith("/pressure"):
+            time.sleep(1)
+            total = 0
+            frames = 0
+            while total < 2097152:
+                opcode, _, payload = read_frame(conn)
+                if opcode not in (0, 2) or not payload:
+                    raise ValueError("unexpected inert data frame")
+                total += len(payload)
+                frames += 1
+                if total > 2097152:
+                    raise ValueError("inert data exceeded bound")
+                time.sleep(0.05)
+            print(json.dumps({"path": path, "data_bytes": total,
+                              "data_frames": frames}), flush=True)
+
+        opcode, _, payload = read_frame(conn)
+        if opcode != 8:
             raise ValueError("expected close frame")
         status = struct.unpack("!H", payload[:2])[0]
         reason = payload[2:].decode("ascii")
@@ -60,11 +70,27 @@ def one_connection(listener):
             pass
 
 
+def read_frame(conn):
+    first, second = read_exact(conn, 2)
+    length = second & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", read_exact(conn, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", read_exact(conn, 8))[0]
+    if length > 65536:
+        raise ValueError("frame exceeds inert bound")
+    mask = read_exact(conn, 4) if second & 0x80 else b"\0" * 4
+    payload = read_exact(conn, length)
+    payload = bytes(value ^ mask[i % 4] for i, value in enumerate(payload))
+    return first & 0x0F, first & 0x80, payload
+
+
 with socket.socket() as listener:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 18765))
-    listener.listen(2)
-    listener.settimeout(20)
+    listener.listen(3)
+    listener.settimeout(60)
     print("READY", flush=True)
+    one_connection(listener)
     one_connection(listener)
     one_connection(listener)
