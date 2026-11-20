@@ -54,7 +54,10 @@ def one_connection(listener):
         reason = payload[2:].decode("ascii")
         print(json.dumps({"path": path, "status": status,
                           "reason": reason}), flush=True)
-        conn.sendall(b"\x88\x02\x03\xe8")
+        try:
+            conn.sendall(b"\x88\x02\x03\xe8")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 with socket.socket() as listener:
