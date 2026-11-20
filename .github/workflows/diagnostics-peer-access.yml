@@ -86,7 +86,9 @@ jobs:
               $p.Connect(4000)
               $r[$name] = if ($p.IsConnected) { 'opened' } else { 'not-connected' }
             } catch {
-              $r[$name] = $_.Exception.GetType().Name
+              $errorObject = $_.Exception
+              while ($errorObject.InnerException) { $errorObject = $errorObject.InnerException }
+              $r[$name] = "$($errorObject.GetType().Name):$('{0:X8}' -f $errorObject.HResult)"
             } finally {
               $p.Dispose()
             }
