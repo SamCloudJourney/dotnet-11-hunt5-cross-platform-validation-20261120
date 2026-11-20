@@ -106,6 +106,7 @@ bool OneTrial(const wchar_t* path, bool mutate) {
                     callbackAtReturn ? 1 : 0);
         if (result != NO_ERROR && result != ERROR_IO_PENDING) goto done;
         if (!WaitStage(state.shutdown, state, "shutdown")) goto done;
+        Sleep(250);
     }
     ok = true;
 
