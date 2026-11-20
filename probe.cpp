@@ -4,24 +4,36 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 struct TrialState {
     HANDLE sent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE headers = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE shutdown = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE written = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE received = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE closing = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE failed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::atomic<DWORD> error{0};
     std::atomic<bool> shutdownCallback{false};
+    std::atomic<HINTERNET> socketHandle{nullptr};
+    std::atomic<unsigned> order{0};
+    std::atomic<unsigned> shutdownOrder{0};
+    std::atomic<unsigned> receiveOrder{0};
+    unsigned pendingWrites = 0;
 
     ~TrialState() {
         CloseHandle(sent);
         CloseHandle(headers);
         CloseHandle(shutdown);
+        CloseHandle(written);
+        CloseHandle(received);
+        CloseHandle(closing);
         CloseHandle(failed);
     }
 };
 
-void CALLBACK OnStatus(HINTERNET, DWORD_PTR context, DWORD status, LPVOID info, DWORD) {
+void CALLBACK OnStatus(HINTERNET handle, DWORD_PTR context, DWORD status, LPVOID info, DWORD) {
     auto* state = reinterpret_cast<TrialState*>(context);
     if (state == nullptr) return;
     switch (status) {
@@ -32,8 +44,19 @@ void CALLBACK OnStatus(HINTERNET, DWORD_PTR context, DWORD status, LPVOID info, 
         SetEvent(state->headers);
         break;
     case WINHTTP_CALLBACK_STATUS_SHUTDOWN_COMPLETE:
+        state->shutdownOrder.store(++state->order);
         state->shutdownCallback.store(true);
         SetEvent(state->shutdown);
+        break;
+    case WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE:
+        SetEvent(state->written);
+        break;
+    case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+        state->receiveOrder.store(++state->order);
+        SetEvent(state->received);
+        break;
+    case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+        if (handle == state->socketHandle.load()) SetEvent(state->closing);
         break;
     case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
         if (info != nullptr) {
@@ -53,10 +76,13 @@ bool WaitStage(HANDLE expected, TrialState& state, const char* stage) {
     return false;
 }
 
-bool OneTrial(const wchar_t* path, bool mutate) {
+bool OneTrial(const wchar_t* path, bool mutate, bool pressure) {
     TrialState state;
+    const char* label = pressure ? (mutate ? "pressure_mutate" : "pressure_control") : "baseline";
     HINTERNET session = nullptr, connection = nullptr, request = nullptr, socket = nullptr;
     bool ok = false;
+    char receiveBuffer[4096]{};
+    DWORD receiveResult = 0;
 
     session = WinHttpOpen(L"Inert buffer lifecycle check",
                           WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr,
@@ -85,12 +111,40 @@ bool OneTrial(const wchar_t* path, bool mutate) {
     socket = WinHttpWebSocketCompleteUpgrade(request,
                                              reinterpret_cast<DWORD_PTR>(&state));
     if (!socket) goto done;
+    state.socketHandle.store(socket);
     WinHttpCloseHandle(request);
     request = nullptr;
     if (WinHttpSetStatusCallback(socket, OnStatus,
             WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, 0) ==
         WINHTTP_INVALID_STATUS_CALLBACK) goto done;
     ResetEvent(state.failed);
+
+    receiveResult = WinHttpWebSocketReceive(socket, receiveBuffer,
+                                            sizeof(receiveBuffer), nullptr,
+                                            nullptr);
+    std::printf("trial=%s receive_return=%lu\n",
+                label, receiveResult);
+    if (receiveResult != NO_ERROR && receiveResult != ERROR_IO_PENDING) goto done;
+
+    if (pressure) {
+        std::vector<char> payload(65536, 'Z');
+        for (unsigned i = 0; i < 32; ++i) {
+            ResetEvent(state.written);
+            DWORD sendResult = WinHttpWebSocketSend(
+                socket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                payload.data(), static_cast<DWORD>(payload.size()));
+            if (sendResult == ERROR_IO_PENDING) ++state.pendingWrites;
+            if (sendResult != NO_ERROR && sendResult != ERROR_IO_PENDING) {
+                std::printf("trial=%s send_index=%u send_error=%lu\n",
+                            label, i,
+                            sendResult);
+                goto done;
+            }
+            if (!WaitStage(state.written, state, "write")) goto done;
+        }
+        std::printf("trial=%s bytes_sent=2097152 pending_writes=%u\n",
+                    label, state.pendingWrites);
+    }
 
     {
         char reason[] = "AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -102,18 +156,29 @@ bool OneTrial(const wchar_t* path, bool mutate) {
             for (DWORD i = 0; i < length; ++i) p[i] = 'B';
         }
         std::printf("trial=%s shutdown_return=%lu callback_at_return=%d\n",
-                    mutate ? "mutate" : "baseline", result,
+                    label, result,
                     callbackAtReturn ? 1 : 0);
         if (result != NO_ERROR && result != ERROR_IO_PENDING) goto done;
         if (!WaitStage(state.shutdown, state, "shutdown")) goto done;
+        if (!WaitStage(state.received, state, "receive")) goto done;
+        std::printf("trial=%s shutdown_order=%u receive_order=%u\n",
+                    label,
+                    state.shutdownOrder.load(), state.receiveOrder.load());
         Sleep(250);
     }
     ok = true;
 
 done:
     if (!ok) std::printf("trial=%s setup_or_operation_error=%lu\n",
-                         mutate ? "mutate" : "baseline", GetLastError());
-    if (socket) WinHttpCloseHandle(socket);
+                         label, GetLastError());
+    if (socket) {
+        WinHttpCloseHandle(socket);
+        if (WaitForSingleObject(state.closing, 10000) != WAIT_OBJECT_0) {
+            std::printf("trial=%s closing_callback_missing\n",
+                        label);
+            ok = false;
+        }
+    }
     if (request) WinHttpCloseHandle(request);
     if (connection) WinHttpCloseHandle(connection);
     if (session) WinHttpCloseHandle(session);
@@ -121,7 +186,8 @@ done:
 }
 
 int main() {
-    if (!OneTrial(L"/baseline", false)) return 2;
-    if (!OneTrial(L"/mutate", true)) return 3;
+    if (!OneTrial(L"/baseline", false, false)) return 2;
+    if (!OneTrial(L"/pressure-control", false, true)) return 3;
+    if (!OneTrial(L"/pressure-mutate", true, true)) return 4;
     return 0;
 }
