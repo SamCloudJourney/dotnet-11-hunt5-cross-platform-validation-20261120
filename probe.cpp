@@ -9,19 +9,27 @@ struct TrialState {
     HANDLE sent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE headers = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE shutdown = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE received = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE closing = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE failed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::atomic<DWORD> error{0};
     std::atomic<bool> shutdownCallback{false};
+    std::atomic<HINTERNET> socketHandle{nullptr};
+    std::atomic<unsigned> order{0};
+    std::atomic<unsigned> shutdownOrder{0};
+    std::atomic<unsigned> receiveOrder{0};
 
     ~TrialState() {
         CloseHandle(sent);
         CloseHandle(headers);
         CloseHandle(shutdown);
+        CloseHandle(received);
+        CloseHandle(closing);
         CloseHandle(failed);
     }
 };
 
-void CALLBACK OnStatus(HINTERNET, DWORD_PTR context, DWORD status, LPVOID info, DWORD) {
+void CALLBACK OnStatus(HINTERNET handle, DWORD_PTR context, DWORD status, LPVOID info, DWORD) {
     auto* state = reinterpret_cast<TrialState*>(context);
     if (state == nullptr) return;
     switch (status) {
@@ -32,8 +40,16 @@ void CALLBACK OnStatus(HINTERNET, DWORD_PTR context, DWORD status, LPVOID info, 
         SetEvent(state->headers);
         break;
     case WINHTTP_CALLBACK_STATUS_SHUTDOWN_COMPLETE:
+        state->shutdownOrder.store(++state->order);
         state->shutdownCallback.store(true);
         SetEvent(state->shutdown);
+        break;
+    case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+        state->receiveOrder.store(++state->order);
+        SetEvent(state->received);
+        break;
+    case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+        if (handle == state->socketHandle.load()) SetEvent(state->closing);
         break;
     case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
         if (info != nullptr) {
@@ -57,6 +73,8 @@ bool OneTrial(const wchar_t* path, bool mutate) {
     TrialState state;
     HINTERNET session = nullptr, connection = nullptr, request = nullptr, socket = nullptr;
     bool ok = false;
+    char receiveBuffer[4096]{};
+    DWORD receiveResult = 0;
 
     session = WinHttpOpen(L"Inert buffer lifecycle check",
                           WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr,
@@ -85,12 +103,20 @@ bool OneTrial(const wchar_t* path, bool mutate) {
     socket = WinHttpWebSocketCompleteUpgrade(request,
                                              reinterpret_cast<DWORD_PTR>(&state));
     if (!socket) goto done;
+    state.socketHandle.store(socket);
     WinHttpCloseHandle(request);
     request = nullptr;
     if (WinHttpSetStatusCallback(socket, OnStatus,
             WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, 0) ==
         WINHTTP_INVALID_STATUS_CALLBACK) goto done;
     ResetEvent(state.failed);
+
+    receiveResult = WinHttpWebSocketReceive(socket, receiveBuffer,
+                                            sizeof(receiveBuffer), nullptr,
+                                            nullptr);
+    std::printf("trial=%s receive_return=%lu\n",
+                mutate ? "mutate" : "baseline", receiveResult);
+    if (receiveResult != NO_ERROR && receiveResult != ERROR_IO_PENDING) goto done;
 
     {
         char reason[] = "AAAAAAAAAAAAAAAAAAAAAAAA";
@@ -106,6 +132,10 @@ bool OneTrial(const wchar_t* path, bool mutate) {
                     callbackAtReturn ? 1 : 0);
         if (result != NO_ERROR && result != ERROR_IO_PENDING) goto done;
         if (!WaitStage(state.shutdown, state, "shutdown")) goto done;
+        if (!WaitStage(state.received, state, "receive")) goto done;
+        std::printf("trial=%s shutdown_order=%u receive_order=%u\n",
+                    mutate ? "mutate" : "baseline",
+                    state.shutdownOrder.load(), state.receiveOrder.load());
         Sleep(250);
     }
     ok = true;
@@ -113,7 +143,14 @@ bool OneTrial(const wchar_t* path, bool mutate) {
 done:
     if (!ok) std::printf("trial=%s setup_or_operation_error=%lu\n",
                          mutate ? "mutate" : "baseline", GetLastError());
-    if (socket) WinHttpCloseHandle(socket);
+    if (socket) {
+        WinHttpCloseHandle(socket);
+        if (WaitForSingleObject(state.closing, 10000) != WAIT_OBJECT_0) {
+            std::printf("trial=%s closing_callback_missing\n",
+                        mutate ? "mutate" : "baseline");
+            ok = false;
+        }
+    }
     if (request) WinHttpCloseHandle(request);
     if (connection) WinHttpCloseHandle(connection);
     if (session) WinHttpCloseHandle(session);
