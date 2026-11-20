@@ -19,8 +19,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Write-Host "Runner image: $env:ImageOS $env:ImageVersion"
           $winhttp = Join-Path $env:windir 'System32\winhttp.dll'
-          Get-Item $winhttp | Select-Object FullName, Length, @{Name='Version';Expression={$_.VersionInfo.FileVersion}}
-          Get-FileHash $winhttp -Algorithm SHA256
+          Write-Host "WinHTTP DLL: $winhttp"
+          Write-Host "WinHTTP version: $((Get-Item $winhttp).VersionInfo.FileVersion)"
+          Write-Host "WinHTTP SHA256: $((Get-FileHash $winhttp -Algorithm SHA256).Hash)"
           $vcvars = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
           if (-not (Test-Path $vcvars)) { throw 'MSVC environment missing' }
           cmd /c "`"$vcvars`" && cl /nologo /EHsc /W4 /O2 probe.cpp /link winhttp.lib"
@@ -31,9 +32,9 @@ jobs:
             .\probe.exe
             if ($LASTEXITCODE -ne 0) { throw "probe failed: $LASTEXITCODE" }
             Wait-Process -Id $server.Id -Timeout 15
-            Get-Content 'server.log'
-            if (Test-Path 'server.err') { Get-Content 'server.err' }
           }
           finally {
             if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
+            if (Test-Path 'server.log') { Get-Content 'server.log' }
+            if (Test-Path 'server.err') { Get-Content 'server.err' }
           }
