@@ -1,0 +1,120 @@
+name: Inert diagnostics pipe peer access
+on:
+  push:
+    branches: [h5-diag-pipe-acl]
+permissions:
+  contents: read
+jobs:
+  peer-access:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Compare named pipe access under two local accounts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Runner: $env:ImageOS $env:ImageVersion"
+          $url = 'https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/11.0.0/dotnet-hosting-11.0.0-win.exe'
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-hosting-11.0.0-win.exe'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Runtime installer signature invalid'
+          }
+          $bundleHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          Write-Host "Hosting bundle SHA256: $bundleHash"
+          if ($bundleHash -ne '533980AB99CA9FA7A825D7B1F7640B95B35AC2511532D52174FE0D15EE70742C') {
+            throw 'Unexpected hosting bundle identity'
+          }
+          $install = Start-Process -FilePath $installer -ArgumentList '/quiet','/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010) {
+            throw "Hosting bundle installation failed: $($install.ExitCode)"
+          }
+          dotnet --list-runtimes
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet runtime inventory failed' }
+          $source = Join-Path $env:RUNNER_TEMP 'H5DiagTarget'
+          dotnet new console --framework net11.0 --no-restore -o $source
+          if ($LASTEXITCODE -ne 0) { throw 'Target template failed' }
+          @'
+          using System;
+          using System.Threading;
+          Console.WriteLine("H5_TARGET_READY");
+          Thread.Sleep(TimeSpan.FromMinutes(8));
+          '@ | Set-Content -LiteralPath (Join-Path $source 'Program.cs') -Encoding UTF8
+          $project = (Get-ChildItem -LiteralPath $source -Filter '*.csproj' | Select-Object -First 1).FullName
+          dotnet build $project -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'Target build failed' }
+          $appDll = Join-Path $source 'bin\Release\net11.0\H5DiagTarget.dll'
+          $dotnet = (Get-Command dotnet).Source
+          $target = Start-Process -FilePath $dotnet -ArgumentList ('"' + $appDll + '"') -PassThru
+          try {
+            $pipeName = "dotnet-diagnostic-$($target.Id)"
+            $ready = $false
+            for ($i = 0; $i -lt 20; $i++) {
+              $adminPipe = [IO.Pipes.NamedPipeClientStream]::new('.', $pipeName, [IO.Pipes.PipeDirection]::InOut)
+              try {
+                $adminPipe.Connect(1000)
+                $ready = $adminPipe.IsConnected
+                if ($ready) { break }
+              } catch { Start-Sleep -Milliseconds 300 } finally { $adminPipe.Dispose() }
+            }
+            if (-not $ready) { throw 'Same-owner diagnostics pipe baseline did not open' }
+            $module = Get-Process -Id $target.Id -Module | Where-Object { $_.ModuleName -eq 'coreclr.dll' } | Select-Object -First 1
+            if (-not $module) { throw 'CoreCLR module not loaded' }
+            Write-Host "Target PID: $($target.Id)"
+            Write-Host "Target owner: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+            Write-Host "Loaded CoreCLR: $($module.FileName)"
+            Write-Host "Loaded CoreCLR SHA256: $((Get-FileHash -LiteralPath $module.FileName -Algorithm SHA256).Hash)"
+            Write-Host 'Same-owner read/write pipe baseline: opened'
+            $work = 'C:\ProgramData\H5DiagPeerAccess'
+            New-Item -ItemType Directory -Force -Path $work | Out-Null
+            & icacls $work /grant 'Users:(OI)(CI)M' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Fixture directory ACL failed' }
+            $script = Join-Path $work 'probe.ps1'
+            $output = Join-Path $work 'result.json'
+            @'
+          param([string]$PipeName, [string]$Output)
+          $ErrorActionPreference = 'Stop'
+          $r = [ordered]@{
+            user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            isAdmin = ([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          }
+          foreach ($name in @('InOut','In')) {
+            $direction = [Enum]::Parse([IO.Pipes.PipeDirection], $name)
+            $p = [IO.Pipes.NamedPipeClientStream]::new('.', $PipeName, $direction)
+            try {
+              $p.Connect(4000)
+              $r[$name] = if ($p.IsConnected) { 'opened' } else { 'not-connected' }
+            } catch {
+              $r[$name] = $_.Exception.GetType().Name
+            } finally {
+              $p.Dispose()
+            }
+          }
+          $r | ConvertTo-Json -Compress | Set-Content -LiteralPath $Output -Encoding UTF8
+          '@ | Set-Content -LiteralPath $script -Encoding UTF8
+            $user = 'h5lowpeer'
+            $password = [Guid]::NewGuid().ToString('N') + 'aA1!'
+            $secure = ConvertTo-SecureString $password -AsPlainText -Force
+            $null = New-LocalUser -Name $user -Password $secure -PasswordNeverExpires
+            try {
+              $credential = [pscredential]::new("$env:COMPUTERNAME\$user", $secure)
+              $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $script + '"'),'-PipeName',$pipeName,'-Output',('"' + $output + '"'))
+              $child = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential $credential -Wait -PassThru -LoadUserProfile
+              if ($child.ExitCode -ne 0) { throw "Low user probe failed: $($child.ExitCode)" }
+              $result = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
+              Write-Host "Low user: $($result.user); admin=$($result.isAdmin)"
+              Write-Host "Low user read/write: $($result.InOut)"
+              Write-Host "Low user read-only: $($result.In)"
+              if ($result.isAdmin) { throw 'Low user unexpectedly has admin role' }
+              if ($result.InOut -eq 'opened') { throw 'Cross-user write-capable diagnostics pipe opened' }
+              Write-Host 'Cross-user write-capable pipe admission denied'
+            } finally {
+              Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+              $password = $null
+              $secure = $null
+              $credential = $null
+            }
+          } finally {
+            Stop-Process -Id $target.Id -Force -ErrorAction SilentlyContinue
+          }
